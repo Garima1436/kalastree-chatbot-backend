@@ -4,6 +4,8 @@ import pandas as pd
 from bs4 import BeautifulSoup
 from pathlib import Path
 import shutil
+import requests
+import os
 
 # -----------------------------
 # LangChain Document Import
@@ -107,6 +109,53 @@ for data_file in sorted(DATA_DIR.iterdir()):
                 }
             )
         )
+
+# ==================================================
+# WEBSITE CONTENT
+# ==================================================
+
+# Read URLs from environment variable or config file
+urls = []
+
+# Check for environment variable
+urls_env = os.getenv("KNOWLEDGE_BASE_URLS", "")
+if urls_env:
+    urls.extend([url.strip() for url in urls_env.split(",")])
+
+# Check for urls.txt file in data directory
+urls_file = DATA_DIR / "urls.txt"
+if urls_file.exists():
+    with open(urls_file, "r") as f:
+        for line in f:
+            url = line.strip()
+            if url and not url.startswith("#"):
+                urls.append(url)
+
+# Fetch and process each URL
+for url in urls:
+    try:
+        print(f"Fetching content from: {url}")
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.content, "html.parser")
+        text = soup.get_text(separator="\n")
+        
+        if text.strip():
+            documents.append(
+                Document(
+                    page_content=text,
+                    metadata={
+                        "source": url,
+                        "type": "website"
+                    }
+                )
+            )
+            print(f"Successfully fetched: {url}")
+    except requests.RequestException as e:
+        print(f"Error fetching {url}: {e}")
+    except Exception as e:
+        print(f"Error processing {url}: {e}")
 
 print(f"Loaded {len(documents)} documents")
 

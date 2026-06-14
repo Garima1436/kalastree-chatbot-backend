@@ -3,6 +3,7 @@
 import pandas as pd
 from bs4 import BeautifulSoup
 from pathlib import Path
+import shutil
 
 # -----------------------------
 # LangChain Document Import
@@ -39,80 +40,73 @@ DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 # CSV FILE
 # ==================================================
 
-csv_file = DATA_DIR / "women_fintech_gi_survey_india.csv"
+for data_file in sorted(DATA_DIR.iterdir()):
+    if data_file.is_dir() or data_file.name == "chroma_db":
+        continue
 
-df = pd.read_csv(csv_file)
+    if data_file.suffix.lower() == ".csv":
+        df = pd.read_csv(data_file)
 
-for _, row in df.iterrows():
+        for _, row in df.iterrows():
+            text = "\n".join(
+                [f"{col}: {row[col]}" for col in df.columns]
+            )
 
-    text = "\n".join(
-        [f"{col}: {row[col]}" for col in df.columns]
-    )
+            documents.append(
+                Document(
+                    page_content=text,
+                    metadata={
+                        "source": data_file.name,
+                        "type": "csv",
+                    }
+                )
+            )
 
-    documents.append(
-        Document(
-            page_content=text,
-            metadata={
-                "source": "survey_csv"
-            }
+    elif data_file.suffix.lower() in {".xlsx", ".xls"}:
+        xls = pd.ExcelFile(data_file)
+
+        for sheet in xls.sheet_names:
+            sheet_df = pd.read_excel(
+                data_file,
+                sheet_name=sheet
+            )
+
+            for _, row in sheet_df.iterrows():
+                text = "\n".join(
+                    [f"{col}: {row[col]}" for col in sheet_df.columns]
+                )
+
+                documents.append(
+                    Document(
+                        page_content=text,
+                        metadata={
+                            "source": data_file.name,
+                            "type": "excel",
+                            "sheet": sheet
+                        }
+                    )
+                )
+
+    elif data_file.suffix.lower() in {".html", ".htm"}:
+        with open(data_file, "r", encoding="utf-8") as f:
+            html = f.read()
+
+        soup = BeautifulSoup(
+            html,
+            "html.parser"
         )
-    )
 
-# ==================================================
-# EXCEL FILE
-# ==================================================
-
-excel_file = DATA_DIR / "Women_GI_Multimodal_Research_Report (1).xlsx"
-
-xls = pd.ExcelFile(excel_file)
-
-for sheet in xls.sheet_names:
-
-    sheet_df = pd.read_excel(
-        excel_file,
-        sheet_name=sheet
-    )
-
-    for _, row in sheet_df.iterrows():
-
-        text = "\n".join(
-            [f"{col}: {row[col]}" for col in sheet_df.columns]
-        )
+        text = soup.get_text(separator="\n")
 
         documents.append(
             Document(
                 page_content=text,
                 metadata={
-                    "source": "excel",
-                    "sheet": sheet
+                    "source": data_file.name,
+                    "type": "html"
                 }
             )
         )
-
-# ==================================================
-# HTML FILE
-# ==================================================
-
-html_file = DATA_DIR / "garima_literature_methodology.html"
-
-with open(html_file, "r", encoding="utf-8") as f:
-    html = f.read()
-
-soup = BeautifulSoup(
-    html,
-    "html.parser"
-)
-
-text = soup.get_text(separator="\n")
-
-documents.append(
-    Document(
-        page_content=text,
-        metadata={
-            "source": "literature"
-        }
-    )
-)
 
 print(f"Loaded {len(documents)} documents")
 
@@ -143,10 +137,15 @@ print(f"Chunks created: {len(chunks)}")
 # VECTOR DATABASE
 # ==================================================
 
+vector_db_dir = Path(__file__).resolve().parent / "chroma_db"
+
+if vector_db_dir.exists():
+    shutil.rmtree(vector_db_dir)
+
 vectordb = Chroma.from_documents(
     documents=chunks,
     embedding=embedding_model,
-    persist_directory="chroma_db"
+    persist_directory=str(vector_db_dir)
 )
 
 print("Vector DB created successfully!")

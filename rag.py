@@ -1,214 +1,78 @@
-from dotenv import load_dotenv
-import os
+from graph import graph
+from retrieval import retrieve_context
+from nodes import generate_answer
+import threading
+import queue
+import re
 
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.vectorstores import Chroma
-from langchain_google_genai import ChatGoogleGenerativeAI
 
-load_dotenv()
-
-# =====================================================
-# EMBEDDINGS
-# =====================================================
-
-embedding_model = HuggingFaceEmbeddings(
-    model_name="BAAI/bge-small-en-v1.5"
-)
-
-# =====================================================
-# VECTOR DATABASE
-# =====================================================
-
-vectordb = Chroma(
-    persist_directory="chroma_db",
-    embedding_function=embedding_model
-)
-
-retriever = vectordb.as_retriever(
-    search_kwargs={"k": 10}
-)
-
-# =====================================================
-# GEMINI
-# =====================================================
-
-llm = ChatGoogleGenerativeAI(
-    model="gemini-2.5-flash",
-    temperature=0.2,
-    google_api_key=os.getenv("GOOGLE_API_KEY")
-)
-
-# =====================================================
-# QUERY REWRITER
-# =====================================================
-
-def rewrite_query(question):
-
-    prompt = f"""
-You are an expert query understanding engine.
-
-Rewrite the user's question so that it becomes
-clear, grammatically correct and optimized
-for retrieval from a research database.
-
-Rules:
-- Fix spelling mistakes
-- Expand abbreviations
-- Infer user intent
-- Preserve meaning
-- Return ONLY the rewritten query
-
-Examples:
-
-Input:
-category of products that belong from orrisa
-
-Output:
-What GI product categories are associated with Odisha?
-
-Input:
-gujrat products
-
-Output:
-What GI products are associated with Gujarat?
-
-Input:
-highest fintech state
-
-Output:
-Which state has the highest fintech index?
-
-Question:
-{question}
-"""
-
+def _run_graph(question, out_q):
     try:
-        response = llm.invoke(prompt)
-        return response.content.strip()
-
-    except:
-        return question
-
-
-# =====================================================
-# ANSWER GENERATION
-# =====================================================
-
-def ask_bot(question):
-
-    try:
-
-        # ------------------------------
-        # Rewrite query
-        # ------------------------------
-
-        rewritten_query = rewrite_query(question)
-
-        # ------------------------------
-        # Retrieve context
-        # ------------------------------
-
-        docs = retriever.invoke(rewritten_query)
-
-        if not docs:
-
-            return {
-                "answer":
-                "I could not find that information in the knowledge base.",
-                "sources": []
-            }
-
-        # ------------------------------
-        # Build context
-        # ------------------------------
-
-        context = "\n\n".join(
-            [doc.page_content for doc in docs]
-        )
-
-        # ------------------------------
-        # Main Prompt
-        # ------------------------------
-
-        prompt = f"""
-You are KalaStree AI.
-
-You answer questions about:
-
-- GI Products
-- Women Entrepreneurship
-- Women FinTech Adoption
-- Empowerment Index
-- Research Reports
-- Survey Data
-- Policy Recommendations
-
-IMPORTANT RULES:
-
-1. Use ONLY the provided context.
-
-2. The user may:
-   - make spelling mistakes
-   - use informal language
-   - ask summary questions
-   - ask comparison questions
-   - ask aggregation questions
-
-3. If information is not present in the context,
-   respond EXACTLY:
-
-   I could not find that information in the knowledge base.
-
-4. Never hallucinate.
-
-5. For numeric values:
-   report exact values.
-
-6. For lists:
-   use bullet points.
-
-7. If multiple records are relevant:
-   summarize them clearly.
-
-Context:
-{context}
-
-Question:
-{question}
-
-Answer:
-"""
-
-        response = llm.invoke(prompt)
-
-        # ------------------------------
-        # Sources
-        # ------------------------------
-
-        sources = []
-
-        for doc in docs:
-
-            source = doc.metadata.get(
-                "source",
-                "unknown"
-            )
-
-            if source not in sources:
-                sources.append(source)
-
-        return {
-            "answer": response.content,
-            "sources": sources,
-            "rewritten_query": rewritten_query
-        }
-
+        result = graph.invoke({
+            "question": question,
+            "rewritten_query": "",
+            "context": "",
+            "answer": "",
+            "retrieval_grade": "",
+            "grounding_grade": ""
+        })
+        out_q.put(("ok", result))
     except Exception as e:
+        out_q.put(("error", str(e)))
 
-        print("RAG ERROR:", str(e))
 
-        return {
-            "answer":
-            "The AI service is temporarily unavailable. Please try again later.",
-            "sources": []
-        }
+def _keyword_overlap(question, answer):
+    q_tokens = [t for t in re.findall(r"\w+", question.lower()) if len(t) > 2]
+    if not q_tokens:
+        return 0.0
+    a_text = (answer or "").lower()
+    hits = sum(1 for t in q_tokens if t in a_text)
+    return hits / len(q_tokens)
+
+
+def ask_bot(question, rag_timeout: float = 20.0):
+    """Run the fast extractive pipeline and the RAG pipeline in parallel.
+
+    Return the answer that scores higher by a simple keyword-overlap metric,
+    preferring the faster extractive result when RAG is unavailable or slower.
+    """
+
+    try:
+        context, docs = retrieve_context(question, k=8)
+        extractive = generate_answer({"question": question, "context": context, "docs": docs})
+    except Exception:
+        extractive = {"answer": "I could not find that information in the knowledge base.", "sources": []}
+
+    out_q = queue.Queue()
+    t = threading.Thread(target=_run_graph, args=(question, out_q), daemon=True)
+    t.start()
+
+    rag_result = None
+    try:
+        status, payload = out_q.get(timeout=rag_timeout)
+        if status == "ok":
+            rag_result = payload
+    except queue.Empty:
+        rag_result = None
+
+    extractive_answer = extractive.get("answer", "")
+    extractive_score = _keyword_overlap(question, extractive_answer)
+
+    rag_answer = ""
+    rag_score = 0.0
+    if rag_result:
+        rag_answer = rag_result.get("answer", "")
+        rag_score = _keyword_overlap(question, rag_answer)
+
+    if rag_result and rag_score > extractive_score + 0.05:
+        chosen = (rag_answer, rag_result.get("sources", []), "rag")
+    else:
+        chosen = (extractive_answer, extractive.get("sources", []), "extractive")
+
+    answer_text, sources, pipeline = chosen
+
+    return {
+        "answer": answer_text or "I could not find that information in the knowledge base.",
+        "sources": sources or [],
+        "pipeline": pipeline
+    }

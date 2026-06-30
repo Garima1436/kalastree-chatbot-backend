@@ -1,9 +1,11 @@
 from dotenv import load_dotenv
 import os
+from pathlib import Path
 
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 
 load_dotenv()
 
@@ -22,53 +24,61 @@ retriever = vectordb.as_retriever(
     search_kwargs={"k": 5}
 )
 
-# Gemini
-llm = ChatGoogleGenerativeAI(
-    model="gemini-2.5-flash",
+llm = ChatOpenAI(
+    model="gpt-4o-mini",
     temperature=0.3,
-    google_api_key=os.getenv("GOOGLE_API_KEY")
+    api_key=os.getenv("OPENAI_API_KEY")
 )
 
-def ask_bot(question):
+# Maps raw filenames to human-readable source labels
+SOURCE_LABELS = {
+    "KalaStree_FINAL_Complete.xlsx": "KalaStree Research Report",
+    "Women_GI_Multimodal_Research_Report__with_images_v2.xlsx": "GI Multimodal Research Report",
+    "women_fintech_gi_survey_india.csv": "Women FinTech & GI Survey",
+    "garima_literature_methodology.html": "Literature & Methodology",
+    "_Garima's Literaturchrome___newtab_e Review Tracker (1).xlsx": "Literature Review Tracker",
+}
 
+SYSTEM_PROMPT = """You are KalaStree GI Assistant, a specialist in Indian Geographical Indication (GI) products, women artisans, and FinTech adoption research.
+
+Rules:
+- Answer ONLY using the provided context.
+- If the answer is not in the context, say exactly: "I could not find that information in the knowledge base."
+- Be concise and accurate. Use bullet points or short paragraphs where appropriate.
+- Do not fabricate statistics, names, or policy details not found in the context.
+- You may refer to previous messages in the conversation to give coherent follow-up answers."""
+
+
+def ask_bot(question: str, history: list[dict] | None = None) -> dict:
     docs = retriever.invoke(question)
 
-    context = "\n\n".join(
-        [doc.page_content for doc in docs]
-    )
+    context = "\n\n".join([doc.page_content for doc in docs])
 
-    prompt = f"""
-You are KalaStree GI Assistant.
+    messages = [
+        SystemMessage(content=f"{SYSTEM_PROMPT}\n\nContext:\n{context}")
+    ]
 
-Answer ONLY using the provided context.
+    # Inject prior conversation turns (capped at last 8 messages = 4 turns)
+    if history:
+        for msg in history[-8:]:
+            if msg.get("role") == "user":
+                messages.append(HumanMessage(content=msg["text"]))
+            elif msg.get("role") == "ai":
+                messages.append(AIMessage(content=msg["text"]))
 
-If the answer is not available in the context,
-say:
+    messages.append(HumanMessage(content=question))
 
-'I could not find that information in the knowledge base.'
-
-Context:
-{context}
-
-Question:
-{question}
-"""
-
-    response = llm.invoke(prompt)
+    response = llm.invoke(messages)
 
     sources = []
-
     for doc in docs:
-
-        source = doc.metadata.get(
-            "source",
-            "unknown"
-        )
-
-        if source not in sources:
-            sources.append(source)
+        raw = doc.metadata.get("source", "unknown")
+        filename = Path(raw).name
+        label = SOURCE_LABELS.get(filename, filename)
+        if label not in sources:
+            sources.append(label)
 
     return {
         "answer": response.content,
-        "sources": sources
+        "sources": sources,
     }
